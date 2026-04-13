@@ -15,34 +15,41 @@
 # ==============================================================================
 import cv2
 import numpy as np
-
-# Default to CPU mode. We will only switch to GPU if all checks pass.
+# Default: CPU; will only switch to GPU if all checks pass.
 USE_GPU = False
 xp = np
 
 try:
     import cupy
-    from cupy_backends.cuda.api.runtime import CUDARuntimeError
-    
-    # Check if both CuPy and OpenCV have CUDA support
-    cupy_ready = cupy.cuda.runtime.getDeviceCount() > 0
-    opencv_ready = cv2.cuda.getCudaEnabledDeviceCount() > 0
-    
-    print(f"GPU availability — CuPy device(s): {cupy_ready}, OpenCV CUDA: {opencv_ready}")
-    if cupy_ready and opencv_ready:
-        USE_GPU = True
-        xp = cupy # Only set xp to cupy if everything is ready
-        print("✅ CuPy and OpenCV CUDA support detected. Running with full GPU acceleration.")
-    else:
-        if cupy_ready and not opencv_ready:
-            print("⚠️ CuPy found a GPU, but OpenCV is not compiled with CUDA support.")
-        # If either is not ready, we stick with the CPU defaults
-        print("   Falling back to CPU mode to prevent errors.")
+    from cupy.cuda.runtime import CUDARuntimeError
+    xp = cupy
+    USE_GPU = True
+    print("✅ CuPy detected. Using GPU acceleration.")
 
-except (ImportError, CUDARuntimeError):
-    # This catches errors if cupy isn't installed or can't find a device
-    print("⚠️ CuPy not found or no CUDA device available. Falling back to CPU (NumPy).")
+    try:
+        opencv_ready = cv2.cuda.getCudaEnabledDeviceCount() > 0
 
+        print(f"GPU availability - CuPy device(s): {cupy_ready}, OpenCV CUDA: {opencv_ready}")
+
+        if cupy_ready:
+            print("✅ OpenCV CUDA available.")
+        else:
+            print("⚠️ OpenCV CUDA not available (OK, continuing with CuPy).")
+
+    except:
+        print("⚠️ OpenCV CUDA check failed (ignored).")
+
+except ImportError:
+    xp = np
+    USE_GPU = False
+    print("⚠️ CuPy not found. Falling back to CPU.")
+
+# --- RANDOM SEED FOR REPRODUCIBILITY ---
+SEED = 42
+
+np.random.seed(SEED)
+if USE_GPU:
+    xp.random.seed(SEED)
 
 import os
 import pytesseract
@@ -60,7 +67,7 @@ def ensure_tesseract():
         ) from e
 import re
 from PIL import Image
-import requests
+
 import matplotlib
 import os
 if not os.environ.get("DISPLAY"):
@@ -284,6 +291,19 @@ def get_ellipse_properties(ellipse):
     axis_ratio = minor_axis / major_axis if major_axis > 0 else 0
     return (cx, cy), major_axis, minor_axis, axis_ratio, angle
 
+def generate_base_cylinder_points(radius, height, n_points):
+    rand_radius = xp.sqrt(xp.random.uniform(0, radius**2, n_points))
+    rand_angle = xp.random.uniform(0, 2 * xp.pi, n_points)
+
+    x = rand_radius * xp.cos(rand_angle)
+    y = rand_radius * xp.sin(rand_angle)
+    z = xp.random.uniform(-height / 2, height / 2, n_points)
+
+    points = xp.vstack((x, y, z))
+    luminosity = xp.exp(-rand_radius / (radius * 0.3))
+
+    return points, luminosity
+
 def create_synthetic_galaxy_image_3d(inclination, pa, radius=CYLINDER_RADIUS, height=CYLINDER_HEIGHT, size=SYNTH_IMAGE_SIZE, n_points=100000):
     """
     Creates a 3D cylinder model with a smooth luminosity profile.
@@ -316,9 +336,12 @@ def create_synthetic_galaxy_image_3d(inclination, pa, radius=CYLINDER_RADIUS, he
 
 
 def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle):
-    """
-    PRIMARY METHOD: Uses a hybrid cost function combining 3D model luminosity and geometry.
-    """
+    points, luminosity = generate_base_cylinder_points(
+    CYLINDER_RADIUS,
+    CYLINDER_HEIGHT,
+    n_points=100000
+    )
+
     i_range, pa_range = np.arange(0, 91, 1), np.arange(0, 181, 1)
     best_i, best_pa, min_cost = None, None, float('inf')
     
