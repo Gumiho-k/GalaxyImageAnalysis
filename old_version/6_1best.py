@@ -15,35 +15,44 @@
 # ==============================================================================
 import cv2
 import numpy as np
+import traceback
 # Default: CPU; will only switch to GPU if all checks pass.
-USE_GPU = False          # CuPy
-USE_OPENCV_CUDA = False   # OpenCV
+USE_GPU = False
+USE_OPENCV_CUDA = False
 xp = np
+
+def disable_gpu(reason="Unknown GPU error"):
+    global USE_GPU, xp
+    USE_GPU = False
+    xp = np
+    print(f"⚠️ GPU disabled: {reason}. Falling back to CPU.")
 
 try:
     import cupy
-    from cupy.cuda.runtime import CUDARuntimeError
-    xp = cupy
-    USE_GPU = True
-    print("✅ CuPy detected. Using GPU acceleration.")
+    cupy_ready = cupy.cuda.runtime.getDeviceCount() > 0
+    if cupy_ready:
+        try:
+            # Stronger readiness test: force CuPy to use linear algebra backend
+            _a = cupy.eye(2, dtype=cupy.float32)
+            _ = (_a @ _a).get()
+            xp = cupy
+            USE_GPU = True
+            print("✅ CuPy detected. Using GPU acceleration.")
+        except Exception as e:
+            disable_gpu(f"CuPy matmul/cuBLAS unavailable ({e})")
+    else:
+        print("⚠️ CuPy installed but no CUDA device found. Falling back to CPU.")
+except Exception:
+    print("⚠️ CuPy not available. Falling back to CPU.")
 
-    try:
-        cupy_ready = cupy.cuda.runtime.getDeviceCount() > 0
-        opencv_ready = cv2.cuda.getCudaEnabledDeviceCount() > 0
-
-        print(f"GPU availability - CuPy device(s): {cupy_ready}, OpenCV CUDA: {opencv_ready}")
-
-        if opencv_ready:
-            print("✅ OpenCV CUDA available.")
-        else:
-            print("⚠️ OpenCV CUDA not available (OK, continuing with CuPy).")
-    except:
-        print("⚠️ OpenCV CUDA check failed (ignored).")
-
-except ImportError:
-    xp = np
-    USE_GPU = False
-    print("⚠️ CuPy not found. Falling back to CPU.")
+try:
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        USE_OPENCV_CUDA = True
+        print("✅ OpenCV CUDA available.")
+    else:
+        print("⚠️ OpenCV CUDA not available.")
+except Exception:
+    print("⚠️ OpenCV CUDA check failed.")
 
 # --- RANDOM SEED FOR REPRODUCIBILITY ---
 SEED = 42
@@ -52,7 +61,7 @@ np.random.seed(SEED)
 if USE_GPU:
     xp.random.seed(SEED)
 
-import os
+
 import pytesseract
 
 # --- Tesseract availability check ---
@@ -229,6 +238,7 @@ SYNTH_IMAGE_SIZE = 512
 W_GEOMETRIC = 1.5 # Weight for the geometric part of the cost
 W_LUMINOSITY = 1.0  # Weight for the luminosity part of the cost
 
+
 def fit_ellipse_to_image(img, is_synth=False):
     """
     Fits an ellipse using Otsu's method and now returns the contour as well.
@@ -285,12 +295,15 @@ def fit_ellipse_to_dust_lanes(img):
 
 
 def get_ellipse_properties(ellipse):
-    """Extracts center, axes, axis ratio, and angle from an ellipse object."""
     (cx, cy), (d1, d2), angle = ellipse
-    major_axis = max(d1, d2)
-    minor_axis = min(d1, d2)
+    if d1 >= d2:
+        major_axis, minor_axis = d1, d2
+        major_angle = angle
+    else:
+        major_axis, minor_axis = d2, d1
+        major_angle = (angle + 90.0) % 180.0
     axis_ratio = minor_axis / major_axis if major_axis > 0 else 0
-    return (cx, cy), major_axis, minor_axis, axis_ratio, angle
+    return (cx, cy), major_axis, minor_axis, axis_ratio, major_angle
 
 def generate_base_cylinder_points(radius, height, n_points):
     rand_radius = xp.sqrt(xp.random.uniform(0, radius**2, n_points))
@@ -305,6 +318,12 @@ def generate_base_cylinder_points(radius, height, n_points):
 
     return points, luminosity
 
+
+def to_cpu(arr):
+    if USE_GPU and hasattr(arr, "get"):
+        return arr.get()
+    return arr
+
 def create_synthetic_galaxy_image_3d(
     inclination,
     pa,
@@ -313,85 +332,164 @@ def create_synthetic_galaxy_image_3d(
     radius=CYLINDER_RADIUS,
     size=SYNTH_IMAGE_SIZE
 ):
-    i_rad = xp.radians(inclination)
-    pa_rad = xp.radians(pa)
+    # Try current backend first (CuPy if enabled, otherwise NumPy)
+    try:
+        backend = xp
 
-    Rx = xp.array([
-        [1, 0, 0],
-        [0, xp.cos(i_rad), -xp.sin(i_rad)],
-        [0, xp.sin(i_rad), xp.cos(i_rad)]
-    ])
-    Rz = xp.array([
-        [xp.cos(pa_rad), -xp.sin(pa_rad), 0],
-        [xp.sin(pa_rad), xp.cos(pa_rad), 0],
-        [0, 0, 1]
-    ])
+        i_rad = backend.deg2rad(backend.asarray(inclination, dtype=backend.float32))
+        pa_rad = backend.deg2rad(backend.asarray(pa, dtype=backend.float32))
 
-    rotated_points = Rz @ Rx @ points
-    proj_x, proj_y = rotated_points[0, :], rotated_points[1, :]
+        ci = backend.cos(i_rad)
+        si = backend.sin(i_rad)
+        cp = backend.cos(pa_rad)
+        sp = backend.sin(pa_rad)
 
-    hist_range = [[-radius, radius], [-radius, radius]]
-    image, _, _ = xp.histogram2d(
-        proj_x, proj_y,
-        bins=size,
-        range=hist_range,
-        weights=luminosity
-    )
+        Rx = backend.zeros((3, 3), dtype=backend.float32)
+        Rx[0, 0] = 1.0
+        Rx[1, 1] = ci
+        Rx[1, 2] = -si
+        Rx[2, 1] = si
+        Rx[2, 2] = ci
 
-    image_cpu = image.get() if USE_GPU else image
+        Rz = backend.zeros((3, 3), dtype=backend.float32)
+        Rz[0, 0] = cp
+        Rz[0, 1] = -sp
+        Rz[1, 0] = sp
+        Rz[1, 1] = cp
+        Rz[2, 2] = 1.0
+
+        rotated_points = Rz @ Rx @ points
+        proj_x = rotated_points[0, :]
+        proj_y = rotated_points[1, :]
+
+        image, _, _ = backend.histogram2d(
+            proj_x,
+            proj_y,
+            bins=size,
+            range=[[-radius, radius], [-radius, radius]],
+            weights=luminosity
+        )
+
+        image_cpu = to_cpu(image).astype(np.float32)
+
+    except Exception as e:
+        # If GPU backend fails (e.g. missing libcublas), permanently disable GPU and retry on CPU
+        if USE_GPU:
+            disable_gpu(f"CuPy backend failed inside create_synthetic_galaxy_image_3d ({e})")
+
+        points_cpu = to_cpu(points).astype(np.float32)
+        luminosity_cpu = to_cpu(luminosity).astype(np.float32)
+
+        i_rad = np.deg2rad(np.float32(inclination))
+        pa_rad = np.deg2rad(np.float32(pa))
+
+        ci = np.cos(i_rad)
+        si = np.sin(i_rad)
+        cp = np.cos(pa_rad)
+        sp = np.sin(pa_rad)
+
+        Rx = np.zeros((3, 3), dtype=np.float32)
+        Rx[0, 0] = 1.0
+        Rx[1, 1] = ci
+        Rx[1, 2] = -si
+        Rx[2, 1] = si
+        Rx[2, 2] = ci
+
+        Rz = np.zeros((3, 3), dtype=np.float32)
+        Rz[0, 0] = cp
+        Rz[0, 1] = -sp
+        Rz[1, 0] = sp
+        Rz[1, 1] = cp
+        Rz[2, 2] = 1.0
+
+        rotated_points = Rz @ Rx @ points_cpu
+        proj_x = rotated_points[0, :]
+        proj_y = rotated_points[1, :]
+
+        image_cpu, _, _ = np.histogram2d(
+            proj_x,
+            proj_y,
+            bins=size,
+            range=[[-radius, radius], [-radius, radius]],
+            weights=luminosity_cpu
+        )
+        image_cpu = image_cpu.astype(np.float32)
+
     blurred_cpu = cv2.GaussianBlur(image_cpu, (5, 5), 0)
 
-    if np.max(blurred_cpu) > 0:
-        blurred_cpu = blurred_cpu / np.max(blurred_cpu)
+    max_val = float(np.max(blurred_cpu))
+    if max_val > 0:
+        blurred_cpu = blurred_cpu / max_val
 
-    return xp.asarray(blurred_cpu) if USE_GPU else blurred_cpu
+    return blurred_cpu.astype(np.float32)
 
 
 def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle, points, luminosity):
-    points, luminosity = generate_base_cylinder_points(
-    CYLINDER_RADIUS,
-    CYLINDER_HEIGHT,
-    n_points=100000
-    )
-
     i_range, pa_range = np.arange(0, 91, 1), np.arange(0, 181, 1)
     best_i, best_pa, min_cost = None, None, float('inf')
-    
+
+    # Force target image onto CPU for stable numeric comparisons
+    photo_gray_norm_cpu = to_cpu(photo_gray_norm).astype(np.float32)
+
     total_steps = len(i_range) * len(pa_range)
     current_step = 0
-    
+
     print("-> Searching for best fit with Hybrid 3D model... (This may take a moment)")
     start_time = time.time()
 
     for i in i_range:
         for pa in pa_range:
             current_step += 1
-            
-            synth_image = create_synthetic_galaxy_image_3d(i, pa, points, luminosity)
-            
-            synth_image_norm = synth_image * (xp.sum(photo_gray_norm) / xp.sum(synth_image)) if xp.sum(synth_image) > 0 else synth_image
-            cost_luminosity = xp.mean((photo_gray_norm - synth_image_norm)**2)
-            
-            synth_image_cpu = synth_image.get() if USE_GPU else synth_image
+
+            synth_image_cpu = create_synthetic_galaxy_image_3d(
+                i,
+                pa,
+                points,
+                luminosity,
+                radius=CYLINDER_RADIUS,
+                size=SYNTH_IMAGE_SIZE
+            ).astype(np.float32)
+            if not isinstance(synth_image_cpu, np.ndarray):
+                raise TypeError(f"synth_image_cpu is not NumPy: {type(synth_image_cpu)}")
+
+
+            if np.sum(synth_image_cpu) > 0:
+                synth_image_norm_cpu = synth_image_cpu * (
+                    np.sum(photo_gray_norm_cpu) / np.sum(synth_image_cpu)
+                )
+            else:
+                synth_image_norm_cpu = synth_image_cpu
+
+            cost_luminosity = float(
+                np.mean((photo_gray_norm_cpu - synth_image_norm_cpu) ** 2)
+            )
+
             synth_image_u8 = (synth_image_cpu * 255).astype(np.uint8)
 
             try:
                 synth_ellipse, _ = fit_ellipse_to_image(synth_image_u8, is_synth=True)
                 _, _, _, synth_axis_ratio, synth_angle = get_ellipse_properties(synth_ellipse)
-                
-                error_axis_ratio = ((synth_axis_ratio - target_axis_ratio) / target_axis_ratio) ** 2 if target_axis_ratio > 0 else 0
-                diff_angle = min(abs(synth_angle - target_angle), 180 - abs(synth_angle - target_angle))
+
+                error_axis_ratio = (
+                    ((synth_axis_ratio - target_axis_ratio) / target_axis_ratio) ** 2
+                    if target_axis_ratio > 0 else 0.0
+                )
+                diff_angle = min(
+                    abs(synth_angle - target_angle),
+                    180 - abs(synth_angle - target_angle)
+                )
                 error_angle = (diff_angle / 90) ** 2
-                cost_geometric = error_axis_ratio + error_angle
+                cost_geometric = float(error_axis_ratio + error_angle)
+
             except ValueError:
                 cost_geometric = 1e6
 
-            cost = (W_GEOMETRIC * cost_geometric) + (W_LUMINOSITY * cost_luminosity)
-            
+            cost = float((W_GEOMETRIC * cost_geometric) + (W_LUMINOSITY * cost_luminosity))
+
             if cost < min_cost:
                 min_cost = cost
                 best_i, best_pa = i, pa
-                
+
             if current_step % 20 == 0:
                 percent_done = (current_step / total_steps) * 100
                 print(f"\r   ...Progress: {percent_done:.1f}% ({current_step}/{total_steps})", end="")
@@ -423,7 +521,7 @@ def estimate_angles_2D_fallback(photo_gray_norm, target_axis_ratio, target_angle
 def analyze_single_galaxy(image_path, output_plot_path):
     """
     Main function for Step 2. Prioritizes the 3D hybrid fitting method.
-    Uses fixed base cylinder points for reproducible synthetic rendering.
+    Ensures all OpenCV / Matplotlib inputs are NumPy arrays.
     """
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
@@ -454,7 +552,7 @@ def analyze_single_galaxy(image_path, output_plot_path):
         (SYNTH_IMAGE_SIZE, SYNTH_IMAGE_SIZE)
     )
     photo_gray_norm_cpu = photo_gray_cpu.astype(np.float32) / 255.0
-    photo_gray_norm = xp.asarray(photo_gray_norm_cpu) if USE_GPU else photo_gray_norm_cpu
+    photo_gray_norm = photo_gray_norm_cpu
 
     plot_title_suffix = ""
 
@@ -469,8 +567,6 @@ def analyze_single_galaxy(image_path, output_plot_path):
             luminosity = None
         else:
             print("-> Attempting primary 3D Hybrid model fitting...")
-
-            # Generate one fixed base point cloud for reproducibility
             points, luminosity = generate_base_cylinder_points(
                 CYLINDER_RADIUS,
                 CYLINDER_HEIGHT,
@@ -488,6 +584,7 @@ def analyze_single_galaxy(image_path, output_plot_path):
 
     except Exception as e:
         print(f"-> Primary fitting failed ({e}). Using 2D ellipse fitting as a final attempt.")
+        traceback.print_exc()
         est_i, est_pa = estimate_angles_2D_fallback(
             photo_gray_norm, target_axis_ratio, target_angle
         )
@@ -500,12 +597,49 @@ def analyze_single_galaxy(image_path, output_plot_path):
 
     print(f"-> Best Fit: Inclination={est_i}°, PA={est_pa}°")
 
+    if points is not None and luminosity is not None:
+        best_synth_image_cpu = create_synthetic_galaxy_image_3d(
+            est_i,
+            est_pa,
+            points,
+            luminosity
+        ).astype(np.float32)
+    else:
+    # Force CPU backend for fallback plotting
+        if USE_GPU:
+            disable_gpu("Switching to CPU for fallback plotting")
+
+        fallback_points, fallback_luminosity = generate_base_cylinder_points(
+            CYLINDER_RADIUS,
+            CYLINDER_HEIGHT,
+            n_points=100000
+        )
+        best_synth_image_cpu = create_synthetic_galaxy_image_3d(
+            est_i,
+            est_pa,
+            fallback_points,
+            fallback_luminosity
+        ).astype(np.float32)
+
+    if not isinstance(best_synth_image_cpu, np.ndarray):
+        raise TypeError(f"best_synth_image_cpu is not NumPy: {type(best_synth_image_cpu)}")
+    photo_gray_norm_cpu = np.asarray(photo_gray_norm_cpu, dtype=np.float32)
+
+    if np.sum(best_synth_image_cpu) > 0:
+        best_synth_norm_cpu = best_synth_image_cpu * (
+            np.sum(photo_gray_norm_cpu) / np.sum(best_synth_image_cpu)
+        )
+    else:
+        best_synth_norm_cpu = best_synth_image_cpu
+
+    difference_cpu = np.abs(photo_gray_norm_cpu - best_synth_norm_cpu)
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     fig.suptitle(f"Analysis for {os.path.basename(image_path)}{plot_title_suffix}", fontsize=16)
 
     # 1. Original image with fitted ellipse
     ax = axes[0, 0]
-    img_rgb_ellipse = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_rgb_ellipse = cv2.cvtColor(img.copy(), cv2.COLOR_BGR2RGB)
     cv2.ellipse(img_rgb_ellipse, photo_ellipse, (0, 255, 0), 2)
     ax.imshow(img_rgb_ellipse)
     ax.set_title("1. Original Photo w/ Fitted Ellipse")
@@ -513,28 +647,6 @@ def analyze_single_galaxy(image_path, output_plot_path):
 
     # 2. Best-fit synthetic model
     ax = axes[0, 1]
-    if points is not None and luminosity is not None:
-        best_synth_image = create_synthetic_galaxy_image_3d(
-            est_i,
-            est_pa,
-            points,
-            luminosity
-        )
-    else:
-        # For 2D fallback plotting, still generate a stable synthetic image
-        fallback_points, fallback_luminosity = generate_base_cylinder_points(
-            CYLINDER_RADIUS,
-            CYLINDER_HEIGHT,
-            n_points=100000
-        )
-        best_synth_image = create_synthetic_galaxy_image_3d(
-            est_i,
-            est_pa,
-            fallback_points,
-            fallback_luminosity
-        )
-
-    best_synth_image_cpu = best_synth_image.get() if USE_GPU else best_synth_image
     ax.imshow(best_synth_image_cpu, cmap="gray")
     ax.set_title(f"2. Best-Fit Model (i={est_i}°, PA={est_pa}°)")
     ax.axis("off")
@@ -547,13 +659,6 @@ def analyze_single_galaxy(image_path, output_plot_path):
 
     # 4. Difference image
     ax = axes[1, 1]
-    best_synth_norm = (
-        best_synth_image * (xp.sum(photo_gray_norm) / xp.sum(best_synth_image))
-        if xp.sum(best_synth_image) > 0 else best_synth_image
-    )
-    difference = xp.abs(photo_gray_norm - best_synth_norm)
-    difference_cpu = difference.get() if USE_GPU else difference
-
     im = ax.imshow(difference_cpu, cmap="inferno")
     ax.set_title("4. Difference (Model vs. Target)")
     ax.axis("off")
@@ -571,7 +676,7 @@ def analyze_single_galaxy(image_path, output_plot_path):
 if __name__ == "__main__":
     import argparse
     import sys
-    import os
+ 
 
     parser = argparse.ArgumentParser(description="Galaxy separation and analysis pipeline")
     parser.add_argument("-i", "--source_image", default="_photo.png", help="Path to source image")
@@ -608,5 +713,6 @@ if __name__ == "__main__":
                     print(f"-> Analysis complete. Plot saved to {plot_output_path}")
                 except Exception as e:
                     print(f"-> ERROR: Could not analyze {os.path.basename(galaxy_path)}. Reason: {e}")
+                    traceback.print_exc()
                     print("   Skipping this galaxy.")
             print("--- Pipeline Finished ---")
