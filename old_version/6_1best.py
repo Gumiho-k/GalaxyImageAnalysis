@@ -16,7 +16,8 @@
 import cv2
 import numpy as np
 # Default: CPU; will only switch to GPU if all checks pass.
-USE_GPU = False
+USE_GPU = False          # CuPy
+USE_OPENCV_CUDA = False   # OpenCV
 xp = np
 
 try:
@@ -27,15 +28,15 @@ try:
     print("✅ CuPy detected. Using GPU acceleration.")
 
     try:
+        cupy_ready = cupy.cuda.runtime.getDeviceCount() > 0
         opencv_ready = cv2.cuda.getCudaEnabledDeviceCount() > 0
 
         print(f"GPU availability - CuPy device(s): {cupy_ready}, OpenCV CUDA: {opencv_ready}")
 
-        if cupy_ready:
+        if opencv_ready:
             print("✅ OpenCV CUDA available.")
         else:
             print("⚠️ OpenCV CUDA not available (OK, continuing with CuPy).")
-
     except:
         print("⚠️ OpenCV CUDA check failed (ignored).")
 
@@ -237,7 +238,7 @@ def fit_ellipse_to_image(img, is_synth=False):
         _, thresh = cv2.threshold(img, 1, 255, cv2.THRESH_BINARY)
     else:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if USE_GPU:
+        if USE_OPENCV_CUDA:
             gpu_gray = cv2.cuda_GpuMat()
             gpu_gray.upload(gray)
             gauss_filter = cv2.cuda.createGaussianFilter(cv2.CV_8UC1, cv2.CV_8UC1, (15, 15), 0)
@@ -304,38 +305,49 @@ def generate_base_cylinder_points(radius, height, n_points):
 
     return points, luminosity
 
-def create_synthetic_galaxy_image_3d(inclination, pa, radius=CYLINDER_RADIUS, height=CYLINDER_HEIGHT, size=SYNTH_IMAGE_SIZE, n_points=100000):
-    """
-    Creates a 3D cylinder model with a smooth luminosity profile.
-    """
-    rand_radius = xp.sqrt(xp.random.uniform(0, radius**2, n_points))
-    rand_angle = xp.random.uniform(0, 2 * xp.pi, n_points)
-    x = rand_radius * xp.cos(rand_angle)
-    y = rand_radius * xp.sin(rand_angle)
-    z = xp.random.uniform(-height / 2, height / 2, n_points)
-    points = xp.vstack((x, y, z))
-    luminosity = xp.exp(-rand_radius / (radius * 0.3))
-
+def create_synthetic_galaxy_image_3d(
+    inclination,
+    pa,
+    points,
+    luminosity,
+    radius=CYLINDER_RADIUS,
+    size=SYNTH_IMAGE_SIZE
+):
     i_rad = xp.radians(inclination)
     pa_rad = xp.radians(pa)
-    Rx = xp.array([[1, 0, 0], [0, xp.cos(i_rad), -xp.sin(i_rad)], [0, xp.sin(i_rad), xp.cos(i_rad)]])
-    Rz = xp.array([[xp.cos(pa_rad), -xp.sin(pa_rad), 0], [xp.sin(pa_rad), xp.cos(pa_rad), 0], [0, 0, 1]])
+
+    Rx = xp.array([
+        [1, 0, 0],
+        [0, xp.cos(i_rad), -xp.sin(i_rad)],
+        [0, xp.sin(i_rad), xp.cos(i_rad)]
+    ])
+    Rz = xp.array([
+        [xp.cos(pa_rad), -xp.sin(pa_rad), 0],
+        [xp.sin(pa_rad), xp.cos(pa_rad), 0],
+        [0, 0, 1]
+    ])
+
     rotated_points = Rz @ Rx @ points
     proj_x, proj_y = rotated_points[0, :], rotated_points[1, :]
-    
+
     hist_range = [[-radius, radius], [-radius, radius]]
-    image, _, _ = xp.histogram2d(proj_x, proj_y, bins=size, range=hist_range, weights=luminosity)
-    
+    image, _, _ = xp.histogram2d(
+        proj_x, proj_y,
+        bins=size,
+        range=hist_range,
+        weights=luminosity
+    )
+
     image_cpu = image.get() if USE_GPU else image
     blurred_cpu = cv2.GaussianBlur(image_cpu, (5, 5), 0)
-    
+
     if np.max(blurred_cpu) > 0:
-        blurred_cpu = (blurred_cpu / np.max(blurred_cpu))
-        
+        blurred_cpu = blurred_cpu / np.max(blurred_cpu)
+
     return xp.asarray(blurred_cpu) if USE_GPU else blurred_cpu
 
 
-def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle):
+def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle, points, luminosity):
     points, luminosity = generate_base_cylinder_points(
     CYLINDER_RADIUS,
     CYLINDER_HEIGHT,
@@ -355,7 +367,7 @@ def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target
         for pa in pa_range:
             current_step += 1
             
-            synth_image = create_synthetic_galaxy_image_3d(i, pa)
+            synth_image = create_synthetic_galaxy_image_3d(i, pa, points, luminosity)
             
             synth_image_norm = synth_image * (xp.sum(photo_gray_norm) / xp.sum(synth_image)) if xp.sum(synth_image) > 0 else synth_image
             cost_luminosity = xp.mean((photo_gray_norm - synth_image_norm)**2)
@@ -411,9 +423,11 @@ def estimate_angles_2D_fallback(photo_gray_norm, target_axis_ratio, target_angle
 def analyze_single_galaxy(image_path, output_plot_path):
     """
     Main function for Step 2. Prioritizes the 3D hybrid fitting method.
+    Uses fixed base cylinder points for reproducible synthetic rendering.
     """
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img is None: raise ValueError(f"Failed to load image: {image_path}")
+    if img is None:
+        raise ValueError(f"Failed to load image: {image_path}")
 
     try:
         print("-> Attempting to fit ellipse to dust lanes...")
@@ -422,63 +436,127 @@ def analyze_single_galaxy(image_path, output_plot_path):
         print("-> Dust lane fit failed, falling back to standard brightness fit...")
         photo_ellipse, photo_contour = fit_ellipse_to_image(img)
 
-    
     _, _, _, target_axis_ratio, target_angle = get_ellipse_properties(photo_ellipse)
-    
+
     img_h, img_w = img.shape[:2]
     x, y, w, h = cv2.boundingRect(photo_contour)
-    
+
     edge_tolerance = 5
-    is_partial_view = (x <= edge_tolerance or 
-                       y <= edge_tolerance or 
-                       (x + w) >= (img_w - edge_tolerance) or 
-                       (y + h) >= (img_h - edge_tolerance))
-    
-    photo_gray_cpu = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 
-                               (SYNTH_IMAGE_SIZE, SYNTH_IMAGE_SIZE))
+    is_partial_view = (
+        x <= edge_tolerance or
+        y <= edge_tolerance or
+        (x + w) >= (img_w - edge_tolerance) or
+        (y + h) >= (img_h - edge_tolerance)
+    )
+
+    photo_gray_cpu = cv2.resize(
+        cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+        (SYNTH_IMAGE_SIZE, SYNTH_IMAGE_SIZE)
+    )
     photo_gray_norm_cpu = photo_gray_cpu.astype(np.float32) / 255.0
     photo_gray_norm = xp.asarray(photo_gray_norm_cpu) if USE_GPU else photo_gray_norm_cpu
 
     plot_title_suffix = ""
+
     try:
         if is_partial_view:
             print("-> WARNING: Partial view detected. Using 2D fallback for stability.")
-            est_i, est_pa = estimate_angles_2D_fallback(photo_gray_norm, target_axis_ratio, target_angle)
+            est_i, est_pa = estimate_angles_2D_fallback(
+                photo_gray_norm, target_axis_ratio, target_angle
+            )
             plot_title_suffix = " (2D Fallback)"
+            points = None
+            luminosity = None
         else:
             print("-> Attempting primary 3D Hybrid model fitting...")
-            est_i, est_pa = estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle)
+
+            # Generate one fixed base point cloud for reproducibility
+            points, luminosity = generate_base_cylinder_points(
+                CYLINDER_RADIUS,
+                CYLINDER_HEIGHT,
+                n_points=100000
+            )
+
+            est_i, est_pa = estimate_angles_3D_hybrid_fitting(
+                photo_gray_norm,
+                target_axis_ratio,
+                target_angle,
+                points,
+                luminosity
+            )
             plot_title_suffix = " (3D Hybrid Fit)"
+
     except Exception as e:
         print(f"-> Primary fitting failed ({e}). Using 2D ellipse fitting as a final attempt.")
-        est_i, est_pa = estimate_angles_2D_fallback(photo_gray_norm, target_axis_ratio, target_angle)
+        est_i, est_pa = estimate_angles_2D_fallback(
+            photo_gray_norm, target_axis_ratio, target_angle
+        )
         plot_title_suffix = " (2D Fallback)"
-
+        points = None
+        luminosity = None
 
     if est_i is None:
         raise ValueError("Could not determine best-fit angles.")
-    
+
     print(f"-> Best Fit: Inclination={est_i}°, PA={est_pa}°")
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     fig.suptitle(f"Analysis for {os.path.basename(image_path)}{plot_title_suffix}", fontsize=16)
 
+    # 1. Original image with fitted ellipse
     ax = axes[0, 0]
     img_rgb_ellipse = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     cv2.ellipse(img_rgb_ellipse, photo_ellipse, (0, 255, 0), 2)
-    ax.imshow(img_rgb_ellipse); ax.set_title("1. Original Photo w/ Fitted Ellipse"); ax.axis('off')
-    
-    ax = axes[0, 1]
-    best_synth_image = create_synthetic_galaxy_image_3d(est_i, est_pa)
-    ax.imshow(best_synth_image.get() if USE_GPU else best_synth_image, cmap='gray'); ax.set_title(f"2. Best-Fit Model (i={est_i}°, PA={est_pa}°)"); ax.axis('off')
-    
-    ax = axes[1, 0]
-    ax.imshow(photo_gray_norm_cpu, cmap='gray'); ax.set_title("3. Grayscale Target"); ax.axis('off')
+    ax.imshow(img_rgb_ellipse)
+    ax.set_title("1. Original Photo w/ Fitted Ellipse")
+    ax.axis("off")
 
+    # 2. Best-fit synthetic model
+    ax = axes[0, 1]
+    if points is not None and luminosity is not None:
+        best_synth_image = create_synthetic_galaxy_image_3d(
+            est_i,
+            est_pa,
+            points,
+            luminosity
+        )
+    else:
+        # For 2D fallback plotting, still generate a stable synthetic image
+        fallback_points, fallback_luminosity = generate_base_cylinder_points(
+            CYLINDER_RADIUS,
+            CYLINDER_HEIGHT,
+            n_points=100000
+        )
+        best_synth_image = create_synthetic_galaxy_image_3d(
+            est_i,
+            est_pa,
+            fallback_points,
+            fallback_luminosity
+        )
+
+    best_synth_image_cpu = best_synth_image.get() if USE_GPU else best_synth_image
+    ax.imshow(best_synth_image_cpu, cmap="gray")
+    ax.set_title(f"2. Best-Fit Model (i={est_i}°, PA={est_pa}°)")
+    ax.axis("off")
+
+    # 3. Grayscale target
+    ax = axes[1, 0]
+    ax.imshow(photo_gray_norm_cpu, cmap="gray")
+    ax.set_title("3. Grayscale Target")
+    ax.axis("off")
+
+    # 4. Difference image
     ax = axes[1, 1]
-    best_synth_norm = best_synth_image * (xp.sum(photo_gray_norm) / xp.sum(best_synth_image)) if xp.sum(best_synth_image) > 0 else best_synth_image
+    best_synth_norm = (
+        best_synth_image * (xp.sum(photo_gray_norm) / xp.sum(best_synth_image))
+        if xp.sum(best_synth_image) > 0 else best_synth_image
+    )
     difference = xp.abs(photo_gray_norm - best_synth_norm)
-    im = ax.imshow(difference.get() if USE_GPU else difference, cmap='inferno'); ax.set_title("4. Difference (Model vs. Target)"); ax.axis('off')
+    difference_cpu = difference.get() if USE_GPU else difference
+
+    im = ax.imshow(difference_cpu, cmap="inferno")
+    ax.set_title("4. Difference (Model vs. Target)")
+    ax.axis("off")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
