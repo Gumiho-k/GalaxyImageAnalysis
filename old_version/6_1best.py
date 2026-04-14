@@ -4,8 +4,8 @@
 # 1. The CUDA Toolkit:
 #    sudo pacman -S cuda
 #
-# 2. The CuPy library (matches your CUDA version, e.g., 12.x):
-#    pip install cupy-cuda12x
+# 2. The CuPy library (matches your CUDA version, e.g., 13.x):
+#    pip install cupy-cuda13x
 #
 # 3. A CUDA-enabled build of OpenCV. The standard package may not include this.
 #    You might need to build it from source or find a suitable package in the AUR.
@@ -234,7 +234,7 @@ def find_and_separate_galaxies(image_path, output_dir="separated_galaxies"):
 # --- Analysis Constants ---
 CYLINDER_RADIUS = 100 
 CYLINDER_HEIGHT = CYLINDER_RADIUS / 10
-SYNTH_IMAGE_SIZE = 512
+SYNTH_IMAGE_SIZE = 1024
 W_GEOMETRIC = 1.5 # Weight for the geometric part of the cost
 W_LUMINOSITY = 1.0  # Weight for the luminosity part of the cost
 
@@ -425,7 +425,7 @@ def create_synthetic_galaxy_image_3d(
 
 
 def estimate_angles_3D_hybrid_fitting(photo_gray_norm, target_axis_ratio, target_angle, points, luminosity):
-    i_range, pa_range = np.arange(0, 91, 1), np.arange(0, 181, 1)
+    i_range, pa_range = np.arange(0, 91, 0.5), np.arange(0, 181, 0.5)
     best_i, best_pa, min_cost = None, None, float('inf')
 
     # Force target image onto CPU for stable numeric comparisons
